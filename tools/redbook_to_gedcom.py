@@ -170,11 +170,13 @@ def parse_spouse(raw):
 
 # ---------------------------------------------------------------- parse
 def is_caps_name(s):
+    s=re.sub(r"\(.*?\)","",s)
     L=[c for c in s if c.isalpha()]
     return len(L)>=5 and sum(c.isupper() for c in L)/len(L)>0.8 and len(s.split())>=2
 HDR=re.compile(r"^([A-Z][A-Za-z'\.\- ()]{2,70}?):?\s*,\s*(.*)$")
 HDR2=re.compile(r"^([A-Z][A-Z'\.\- ()]{2,70}?)\s+((?:eldest|oldest|youngest|only|second|third|\d+\w*)\s+(?:child|son|dau).*)$")
-KID=re.compile(r"^\s*(\*\s*)?(\d{1,2})\.\s+([A-Z].*)$")
+KID=re.compile(r"^\s*(\*\s*)?(\d{1,2})(?:\.|,(?=\s+[A-Z][a-z]+ [A-Z][^,]{1,40}, b\.))\s+([A-Z].*)$")
+KID2=re.compile(r"^\s*(\*\s*)(\d{1,2})\s+([A-Z][a-z]+ .*?, b\..*)$")
 GKID=re.compile(r"^\s*\((\d{1,2})\)\s+([A-Z].*)$")
 ROMAN=re.compile(r"^[IVXL]+[,.]")
 
@@ -191,6 +193,10 @@ def load_lines(path):
         if not l.strip(): continue
         l=re.sub(r"\b[lI](?=\s+(?:Jan|Feb|Mar|Apr|May|June|July|Aug|Sept|Oct|Nov|Dec)\b)","1",l)
         l=re.sub(r"\b(\d)l(?=\s+(?:Jan|Feb|Mar|Apr|May|June|July|Aug|Sept|Oct|Nov|Dec)\b)",r"\g<1>1",l)
+        # a numbered child that starts in the middle of a line ("... 1947]. 10. Melody Ann ...")
+        mm=re.search(r"(?<=[\].])\s+(\d{1,2})\.\s+(?=[A-Z][a-z]+ [A-Z][a-z]+)",l)
+        if mm and not re.match(r"\s*(\*\s*)?\d",l[:3]) or (mm and mm.start()>10):
+            out.append((page,l[:mm.start()].rstrip(),pdfp)); l=l[mm.start():].strip()
         out.append((page,l.rstrip(), pdfp))
     return out
 
@@ -204,7 +210,7 @@ def logical_items(lines):
         s=l.strip()
         if pdfp<7: continue   # front matter
         if pdfp>=399: break   # indexes
-        m=KID.match(l); g=GKID.match(l); h=HDR2.match(s) or HDR.match(s)
+        m=KID.match(l) or KID2.match(l); g=GKID.match(l); h=HDR2.match(s) or HDR.match(s)
         if g and cur and re.search(r"\bm\.\s*$",cur["t"]): g=None
         if m:
             flush(); cur={"k":"kid","star":bool(m.group(1)),"n":int(m.group(2)),"t":m.group(3),"page":page}; continue
@@ -218,7 +224,7 @@ def logical_items(lines):
             flush(); items.append({"k":"title","t":s,"page":page}); continue
         if cur and cur["k"] in ("kid","gkid","hdr") and not (cur["k"]=="hdr" and len(cur["t"])>900):
             # continuation of a child line only while it looks like the same record
-            if cur["k"]!="hdr" and (cur["t"].rstrip().endswith((".",":","]")) and len(l)<70 or re.match(r"^[A-Z][a-z]+(?: [A-Z][a-z.]+)* (and|&) ",s) or (re.search(r"\bhad \d+ child",s) and not re.search(r";|m\. \(",s.split(" had ")[0]))):
+            if cur["k"]!="hdr" and (cur["t"].rstrip().endswith((".",":","]")) and len(l)<70 and not re.match(r"(She|He|They|Both|It|[a-z(\[])",s) or (re.search(r"\bhad \d+ child",s) and re.match(r"[A-Z][a-z]+\b",s) and not re.match(r"(She|He|They|It|Both)\b",s) and not re.search(r";|m\. \(|\.\s",s.split(" had ")[0]))):
                 flush(); cur={"k":"text","t":s,"page":page,"short":len(l)<75}; continue
             cur["t"]+=("" if cur["t"].endswith("-") else " ")+s
             if cur["k"]=="hdr" and (len(l)<72 and s.endswith((".",":",'"',"”"))): flush()
@@ -233,6 +239,7 @@ def logical_items(lines):
     flush()
     return items
 
+stated=[]
 def run(book, out_full, out_public):
     lines=load_lines(book)
     items=logical_items(lines)
@@ -297,6 +304,35 @@ def run(book, out_full, out_public):
                     if d: sp.death=d
                 break
 
+
+    def pick_couple(p, st, page):
+        m=re.match(r"^(.{3,90}?)\s+had \d+ child",st)
+        if not m or not p.fams: return None
+        head=m.group(1)
+        parts=re.split(r"\s+(?:&|and)\s+",head,maxsplit=1)
+        if len(parts)<2: return None
+        left,right=parts
+        pw=set(norm(p.name).split())
+        lw=set(norm(left).split())-{"jr","sr"}
+        if not lw or not lw<=pw: return None
+        right=re.sub(r"^(?:his|her)\s+(?:first|second|third|fourth|1st|2nd|3rd|former|late)?\s*(?:wife|husband),?\s*","",right).strip(" ,")
+        maiden=re.findall(r"\(([A-Za-z]+)\)",right)
+        rw=set(norm(re.sub(r"\(.*?\)","",right)).split())|{x.lower() for x in maiden}
+        best=None;bs=0
+        for i,fid in enumerate(p.fams):
+            f=fams[fid]; o=f.wife if f.husb==p.id else f.husb
+            if not o: continue
+            ow=norm(people[o].name).split()
+            if not ow: continue
+            sc=(2 if ow[0] in rw else 0)+len((set(ow[1:]) & rw)-pw)
+            if sc>bs: bs=sc;best=i
+        if best is not None and bs>=2: return best
+        # a spouse not seen yet
+        nm=re.sub(r"\s*\(([A-Za-z]+)\)\s*[A-Z][a-z]+$",r" \1",right).strip(" ,")
+        if re.fullmatch(r"[A-Z][A-Za-z.]*(?: [A-Z][A-Za-z.]*){0,4}",nm) and len(nm.split())>=2:
+            f=marry(p,{"name":nm},page); return p.fams.index(f.id)
+        return None
+
     def fam_for(p, idx):
         fl=p.fams
         if not fl:
@@ -309,6 +345,7 @@ def run(book, out_full, out_public):
     def add_child(parent, idx, text, page, star):
         name_part=re.split(r",|\s+b\.\s|\s+\[|;",text,maxsplit=1)[0]
         name_part=re.sub(r"\s+(twin|stillborn).*","",name_part)
+        name_part=re.sub(r"\s*\((?:male|female)\).*|\s+(?:\d+\w*|eldest|oldest|youngest)\s+(?:child|son|dau).*","",name_part)
         nm=clean_name(name_part)
         if not nm or len(nm.split())>7: return None
         c=new_person(nm,page)
@@ -410,6 +447,7 @@ def run(book, out_full, out_public):
                 if info: marry(p,info,page)
             spouse_vitals(p, plain)
             cur=p; story_to=p; fam_idx=0; last_kid=None; seen_kid=False; in_refs=False
+            for n in re.findall(r"had (\d+) child",plain): stated.append((p.id,0,int(n),page))
             continue
         if k=="kid":
             c=add_child(cur, fam_idx, it["t"], page, it["star"])
@@ -421,11 +459,12 @@ def run(book, out_full, out_public):
             continue
         # plain text
         t=it["t"]
+        _sn=re.search(r"had (\d+) child",t)
         if re.match(r"^References?\s*:",t): in_refs=True
         st=strip_brackets(t)
         # switching to a later marriage's children
         if re.search(r"\b(second|2nd) (wife|husband)\b.*had \d+ children|m\. \(2\).*(had|They had) \d+ child|and .{3,40} had \d+ children",st) and cur.fams \
-           and re.match(r"(He|She|"+re.escape(cur.name.split()[0])+r")\b",st):
+           and re.match(r"("+("" if seen_kid else "He|She|")+re.escape(cur.name.split()[0])+r")\b",st):
             if re.search(r"\b(second|2nd)\b|m\. \(2\)",st): fam_idx=1
             if re.search(r"\b(third|3rd)\b|m\. \(3\)",st): fam_idx=2
             if re.search(r"\b(first|1st)\b",st): fam_idx=0
@@ -439,11 +478,17 @@ def run(book, out_full, out_public):
                 pm2=re.match(r"\s*([A-Z][A-Za-z ]*?)\s*\(([A-Za-z]+)\)\s*[A-Z][a-z]+\s*$",nm)
                 nm=f"{pm2.group(1)} {pm2.group(2)}" if pm2 else nm
                 ff=marry(cur,{"name":nm.strip()},page); fam_idx=cur.fams.index(ff.id)
+        # "John Nathaniel & Hazel Dean (Barton) Henrie had 3 children": pick the marriage by the named spouse
+        pc=pick_couple(cur, st, page)
+        if pc is not None:
+            fam_idx=pc; story_to=cur
         if seen_kid and last_kid is not None and re.match(r"^[A-Z][a-z]+(?: [A-Z][a-z]+)* (m\.|and)",st) and not in_refs:
             # remarks about the last child (e.g. "Ila Mary Cox m. (2) ...")
             pass
         if re.search(r"\bhad \d+ child",st) and story_to is not cur and re.match(re.escape(cur.name.split()[0]),st):
             story_to=cur
+        if _sn and not in_refs and (re.match(r"(They|He|She|"+re.escape(cur.name.split()[0])+r")\b",st)):
+            stated.append((cur.id,fam_idx,int(_sn.group(1)),page))
         if in_refs:
             cur.story.append(("ref",st)); continue
         if not seen_kid and re.search(r"\bm\.\s*(\(\d\)\s*)?\d",st[:200]):
@@ -499,6 +544,14 @@ def run(book, out_full, out_public):
             living.add(p.id)
     write_ged(out_full, set())
     write_ged(out_public, living)
+    if os.environ.get("AUDIT"):
+        seen=set()
+        with open(os.environ["AUDIT"],"w") as fh:
+            for pid,idx,n,page in stated:
+                if (pid,idx) in seen: continue
+                seen.add((pid,idx)); p=people[pid]
+                got=len(fams[p.fams[min(idx,len(p.fams)-1)]].children) if p.fams else 0
+                if got!=n: fh.write(f"p.{page}\t{pid}\t{p.name}\tfamily {idx+1}\tbook says {n}\tfound {got}\n")
     stats={"people":len(people),"families":len(fams),"living_hidden":len(living),
            "with_story":sum(1 for p in people.values() if any(k=="p" for k,_ in p.story)),
            "with_birth":sum(1 for p in people.values() if p.birth)}
